@@ -1,0 +1,15 @@
+.moodle_token*
+__pycache__/
+*.pyc
+.env
+.env.*
+.venv/
+venv/
+*.log
+*.har
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
