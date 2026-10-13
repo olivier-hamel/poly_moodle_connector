@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for Poly Moodle
+Requires=poly-moodle.service
+After=poly-moodle.service
+ConditionPathExists=%h/.config/tunnel-client/runtime.env
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/tunnel-client/runtime.env
+ExecStart=%h/.local/bin/tunnel-client run --profile poly-moodle
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

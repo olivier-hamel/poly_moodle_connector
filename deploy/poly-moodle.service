@@ -1,0 +1,16 @@
+[Unit]
+Description=Personal read-only Moodle MCP server
+
+[Service]
+Type=simple
+WorkingDirectory=%h/poly-moodle
+ExecStart=%h/poly-moodle/.venv/bin/python %h/poly-moodle/server_http.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

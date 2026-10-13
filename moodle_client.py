@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import os
+import time
 import requests
 
 BASE_URL = "https://moodle.polymtl.ca"
@@ -64,6 +66,122 @@ class MoodleClient:
              "fullname": c.get("fullname", "")}
             for c in courses
         ]
+
+    @staticmethod
+    def _date(timestamp):
+        """Moodle uses zero for unset dates; expose real dates as UTC ISO 8601."""
+        return (datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+                if timestamp else None)
+
+    @staticmethod
+    def _warnings(data):
+        # Server warning messages can contain traces or private URLs.
+        return [{k: warning[k] for k in ("item", "itemid", "warningcode")
+                 if k in warning} for warning in data.get("warnings", [])]
+
+    def list_events(self, course_id: int | None = None,
+                    time_start: int | None = None, time_end: int | None = None):
+        """Read visible calendar events, including current user's group events."""
+        if course_id is not None and course_id <= 0:
+            raise MoodleError("course_id must be positive.")
+        start = int(time.time()) if time_start is None else time_start
+        end = start + 90 * 86400 if time_end is None else time_end
+        if start < 0 or end <= start:
+            raise MoodleError("Use nonnegative Unix timestamps with time_end > time_start.")
+        courses = self.list_courses()
+        if course_id is not None:
+            courses = [course for course in courses if course["id"] == course_id]
+            if not courses:
+                raise MoodleError("Course not found in your enrolled courses.")
+        parameters = {
+            "options[timestart]": start, "options[timeend]": end,
+            "options[userevents]": int(course_id is None),
+            "options[siteevents]": int(course_id is None),
+            "options[ignorehidden]": 1,
+        }
+        for index, course in enumerate(courses):
+            parameters[f"events[courseids][{index}]"] = course["id"]
+        groups = self.call("core_group_get_course_user_groups", courseid=course_id or 0)
+        warnings = self._warnings(groups)
+        for index, group in enumerate(groups.get("groups", [])):
+            parameters[f"events[groupids][{index}]"] = group["id"]
+        data = self.call("core_calendar_get_calendar_events", **parameters)
+        warnings.extend(self._warnings(data))
+        course_names = {course["id"]: course["shortname"] for course in courses}
+        events = []
+        for event in data.get("events", []):
+            # The legacy API may also return category events for course queries.
+            if course_id is not None and event.get("courseid") != course_id:
+                continue
+            events.append({
+                "id": event["id"], "name": event.get("name", ""),
+                "course_id": event.get("courseid", 0),
+                "course_name": course_names.get(event.get("courseid"), ""),
+                "group_id": event.get("groupid", 0),
+                "event_type": event.get("eventtype", ""),
+                "module": event.get("modulename"),
+                "instance_id": event.get("instance"),
+                "time_start": event["timestart"],
+                "start_at": self._date(event["timestart"]),
+                "duration_seconds": event.get("timeduration", 0),
+                "url": f"{BASE_URL}/calendar/view.php?view=day&time={event['timestart']}",
+            })
+        events.sort(key=lambda event: (event["time_start"], event["id"]))
+        return {"events": events, "warnings": warnings,
+                "time_start": start, "time_end": end, "date_timezone": "UTC"}
+
+    def list_assignments(self, course_id: int | None = None,
+                         include_personal_deadlines: bool = True):
+        """List assignment dates; optionally verify personal extensions and status."""
+        if course_id is not None and course_id <= 0:
+            raise MoodleError("course_id must be positive.")
+        parameters = {} if course_id is None else {"courseids[0]": course_id}
+        data = self.call("mod_assign_get_assignments", **parameters)
+        warnings = self._warnings(data)
+        assignments = []
+        for course in data.get("courses", []):
+            for assignment in course.get("assignments", []):
+                due = assignment.get("duedate") or 0
+                item = {
+                    "id": assignment["id"], "module_id": assignment["cmid"],
+                    "name": assignment.get("name", ""), "course_id": course["id"],
+                    "course_name": course.get("shortname", ""),
+                    "due_at": self._date(due),
+                    "opens_at": self._date(assignment.get("allowsubmissionsfromdate", 0)),
+                    "cutoff_at": self._date(assignment.get("cutoffdate", 0)),
+                    "extension_due_at": None, "effective_due_at": None,
+                    "personal_deadline_checked": False, "submission_status": None,
+                    "submissions_enabled": not bool(assignment.get("nosubmissions", 0)),
+                    "url": f"{BASE_URL}/mod/assign/view.php?id={assignment['cmid']}",
+                }
+                if include_personal_deadlines and item["submissions_enabled"]:
+                    try:
+                        status = self.call("mod_assign_get_submission_status",
+                                           assignid=assignment["id"])
+                    except MoodleError:
+                        warnings.append({"item": "assignment", "itemid": assignment["id"],
+                                         "warningcode": "personal_deadline_unavailable"})
+                    else:
+                        status_warnings = self._warnings(status)
+                        warnings.extend(status_warnings)
+                        attempt = status.get("lastattempt", {})
+                        # Missing data is unknown, never assume no extension.
+                        if attempt.get("extensionduedate") is not None and not status_warnings:
+                            extension = attempt["extensionduedate"]
+                            item["extension_due_at"] = self._date(extension)
+                            item["effective_due_at"] = self._date(max(due, extension))
+                            item["personal_deadline_checked"] = True
+                        else:
+                            warnings.append({"item": "assignment", "itemid": assignment["id"],
+                                             "warningcode": "personal_deadline_unavailable"})
+                        submission = (attempt.get("teamsubmission")
+                                      if assignment.get("teamsubmission")
+                                      else attempt.get("submission"))
+                        item["submission_status"] = (submission or {}).get("status")
+                assignments.append(item)
+        assignments.sort(key=lambda item: (item["effective_due_at"] or item["due_at"] or "9999",
+                                           item["course_id"], item["id"]))
+        return {"assignments": assignments, "warnings": warnings, "date_timezone": "UTC"}
 
     def _course_files(self, course_id: int):
         sections = self.call("core_course_get_contents", courseid=course_id)
